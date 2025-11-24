@@ -1,6 +1,7 @@
 #include <gint/display.h>
 #include <gint/keyboard.h>
 #include <gint/timer.h>
+#include <gint/clock.h>
 #include <math.h>
 #include <stdio.h>
 
@@ -12,6 +13,18 @@
 #define GRAVITY 0.01f
 #define JUMP_FORCE 0.3f
 #define GROUND_Y 2.0f
+
+// Hauteur des yeux pour point de vue First-Person (rendu)
+// 0.8f est une valeur correcte au vu de l'échelle du monde (cube demi-taille = 1)
+#define EYE_HEIGHT 0.8f
+
+// Adjustable target FPS
+#define TARGET_FPS 30
+// Physics substeps per frame; tweak with FPS if desired
+#define SUBSTEPS 5
+
+// Radius for the "player" (camera) used for collisions
+#define PLAYER_RADIUS 0.30f
 
 typedef struct { float x,y,z; } Vec3;
 
@@ -26,9 +39,28 @@ int edges[12][2] = {
     {0,4},{1,5},{2,6},{3,7}
 };
 
-// Murs de collision (zone de -10 à 10 en x et z)
+// Cube instances
+static const Vec3 CUBE1_POS = {0.0f, 0.0f, 0.0f};
+static const Vec3 CUBE2_POS = {3.0f, GROUND_Y - 1.0f, 0.0f};
+
+// Forward declaration for project used by draw_cube
+void project(Vec3 v, Vec3 cam, float ax, float ay, int *sx, int *sy);
+
+// Draw a cube at a world position
+void draw_cube(Vec3 pos, Vec3 cam, float ax, float ay) {
+    for(int i=0; i<12; i++) {
+        Vec3 v1 = { cube[edges[i][0]].x + pos.x, cube[edges[i][0]].y + pos.y, cube[edges[i][0]].z + pos.z };
+        Vec3 v2 = { cube[edges[i][1]].x + pos.x, cube[edges[i][1]].y + pos.y, cube[edges[i][1]].z + pos.z };
+        int x1,y1,x2,y2;
+        project(v1, cam, ax, ay, &x1,&y1);
+        project(v2, cam, ax, ay, &x2,&y2);
+        dline(x1,y1,x2,y2,C_BLACK);
+    }
+}
+
+// World bounds (x and z)
 #define WALL_MIN -10.0f
-#define WALL_MAX 10.0f
+#define WALL_MAX  10.0f
 
 // Rotate point by angles around origin
 void rotate(Vec3 *p, float ax, float ay) {
@@ -49,56 +81,65 @@ void project(Vec3 v, Vec3 cam, float ax, float ay, int *sx, int *sy) {
     *sy = (int)(p.y * scale * SIZE + SCREEN_H/2);
 }
 
-// Vérification des collisions avec les murs
-void check_collision_walls(Vec3 *cam) {
-    if(cam->x < WALL_MIN) cam->x = WALL_MIN;
-    if(cam->x > WALL_MAX) cam->x = WALL_MAX;
-    if(cam->z < WALL_MIN) cam->z = WALL_MIN;
-    if(cam->z > WALL_MAX) cam->z = WALL_MAX;
+// Clamp camera within world walls, accounting for radius
+static inline void clamp_world(Vec3 *cam) {
+    if (cam->x < WALL_MIN + PLAYER_RADIUS) cam->x = WALL_MIN + PLAYER_RADIUS;
+    if (cam->x > WALL_MAX - PLAYER_RADIUS) cam->x = WALL_MAX - PLAYER_RADIUS;
+    if (cam->z < WALL_MIN + PLAYER_RADIUS) cam->z = WALL_MIN + PLAYER_RADIUS;
+    if (cam->z > WALL_MAX - PLAYER_RADIUS) cam->z = WALL_MAX - PLAYER_RADIUS;
 }
 
-// Vérifie et résout les collisions avec le cube
-void check_collision_cube(Vec3 *cam, float ax, float ay) {
-    // Limites du cube (centré à l'origine, taille 2x2x2)
-    float cube_min_x = -1.0f, cube_max_x = 1.0f;
-    float cube_min_y = -1.0f, cube_max_y = 1.0f;
-    float cube_min_z = -1.0f, cube_max_z = 1.0f;
+// Resolve minimal penetration on XZ against one AABB expanded by r, if overlapping in Y
+static inline void resolve_against_box(Vec3 *p, float y, float min_x, float max_x, float min_y, float max_y, float min_z, float max_z, float r) {
+    // Check Y overlap first
+    if (y < min_y - r || y > max_y + r) return;
 
-    // Si la caméra est à l'intérieur du cube, on la repousse
-    if (cam->x >= cube_min_x && cam->x <= cube_max_x &&
-        cam->y >= cube_min_y && cam->y <= cube_max_y &&
-        cam->z >= cube_min_z && cam->z <= cube_max_z) {
+    // Check XZ overlap against expanded box
+    int inside_x = (p->x >= (min_x - r) && p->x <= (max_x + r));
+    int inside_z = (p->z >= (min_z - r) && p->z <= (max_z + r));
+    if (!(inside_x && inside_z)) return;
 
-        // Calcul du vecteur de déplacement pour sortir du cube
-        float push_x = 0.0f, push_y = 0.0f, push_z = 0.0f;
+    // Compute minimal push on X and Z
+    float push_left  = (min_x - r) - p->x;       // negative or zero
+    float push_right = p->x - (max_x + r);       // negative or zero
+    float fix_x = (fabsf(push_left) < fabsf(push_right)) ? push_left : -push_right;
 
-        // On calcule la distance minimale pour sortir du cube sur chaque axe
-        if (cam->x < (cube_min_x + 0.1f)) push_x = cube_min_x - cam->x;
-        if (cam->x > (cube_max_x - 0.1f)) push_x = cube_max_x - cam->x;
-        if (cam->y < (cube_min_y + 0.1f)) push_y = cube_min_y - cam->y;
-        if (cam->y > (cube_max_y - 0.1f)) push_y = cube_max_y - cam->y;
-        if (cam->z < (cube_min_z + 0.1f)) push_z = cube_min_z - cam->z;
-        if (cam->z > (cube_max_z - 0.1f)) push_z = cube_max_z - cam->z;
+    float push_front = (min_z - r) - p->z;       // negative or zero
+    float push_back  = p->z - (max_z + r);       // negative or zero
+    float fix_z = (fabsf(push_front) < fabsf(push_back)) ? push_front : -push_back;
 
-        // On applique le déplacement minimal pour sortir du cube
-        if (fabs(push_x) > fabs(push_z)) {
-            if (fabs(push_x) > fabs(push_y)) {
-                cam->x += push_x;
-            } else {
-                cam->y += push_y;
-            }
-        } else {
-            if (fabs(push_z) > fabs(push_y)) {
-                cam->z += push_z;
-            } else {
-                cam->y += push_y;
-            }
+    if (fabsf(fix_x) < fabsf(fix_z)) p->x += fix_x; else p->z += fix_z;
+}
+
+// Move on XZ plane with collisions against cubes (AABB) and walls
+void move_with_collisions(Vec3 *cam, float dx, float dz) {
+    const float r = PLAYER_RADIUS;
+    Vec3 cubes[2] = { CUBE1_POS, CUBE2_POS };
+
+    // Propose new position (XZ only)
+    Vec3 p = *cam;
+    p.x += dx;
+    p.z += dz;
+
+    // Resolve against each cube; two passes to catch corners
+    for (int pass = 0; pass < 2; pass++) {
+        for (int i = 0; i < 2; i++) {
+            float min_x = cubes[i].x - 1.0f, max_x = cubes[i].x + 1.0f;
+            float min_y = cubes[i].y - 1.0f, max_y = cubes[i].y + 1.0f;
+            float min_z = cubes[i].z - 1.0f, max_z = cubes[i].z + 1.0f;
+            resolve_against_box(&p, cam->y, min_x, max_x, min_y, max_y, min_z, max_z, r);
         }
     }
+
+    cam->x = p.x;
+    cam->z = p.z;
+
+    // Finally clamp to world
+    clamp_world(cam);
 }
 
 int main(void) {
-    Vec3 cam = {0, -GROUND_Y, -5};
+    Vec3 cam = {0, -GROUND_Y, -5}; // Corps (collisions/physique)
     float ax=0, ay=0;
     float velocity_y = 0.0f;
     int on_ground = 0;
@@ -106,15 +147,15 @@ int main(void) {
     while(1) {
         dclear(C_WHITE);
 
-        // Draw cube edges
-        for(int i=0; i<12; i++) {
-            int x1,y1,x2,y2;
-            project(cube[edges[i][0]], cam, ax, ay, &x1,&y1);
-            project(cube[edges[i][1]], cam, ax, ay, &x2,&y2);
-            dline(x1,y1,x2,y2,C_BLACK);
-        }
+        // Vue: point de vue first-person = corps - EYE_HEIGHT sur Y
+        Vec3 cam_view = cam;
+        cam_view.y -= EYE_HEIGHT;
 
-        // Afficher les infos de position
+        // Draw cubes depuis le point de vue
+        draw_cube(CUBE1_POS, cam_view, ax, ay);
+        draw_cube(CUBE2_POS, cam_view, ax, ay);
+
+        // Info
         char buf[32];
         sprintf(buf, "Y:%.1f", cam.y);
         dtext(2, 2, C_BLACK, buf);
@@ -122,48 +163,47 @@ int main(void) {
 
         dupdate();
 
-        // Vérifier les touches sans bloquer
+        // Inputs
         clearevents();
-        int key = KEYEV_NONE;
 
-        // Boucle de mise à jour physique rapide
-        for(int frame=0; frame<5; frame++) {
-            // Vérifier s'il y a une touche pressée
+        // Physics substeps
+        for(int frame=0; frame<SUBSTEPS; frame++) {
             if(keydown(KEY_EXIT)) {
                 return 1;
             }
 
-            // Head rotation (inversé pour être naturel)
+            // Head rotation
             if(keydown(KEY_LEFT))  ay += ROT_SPEED;
             if(keydown(KEY_RIGHT)) ay -= ROT_SPEED;
             if(keydown(KEY_UP))    ax += ROT_SPEED;
             if(keydown(KEY_DOWN))  ax -= ROT_SPEED;
 
-            // Mouvement (8=avant, 2=arrière, 4=gauche, 6=droite)
+            // Compute intended planar motion (XZ) from keys
             float sinA = sinf(ay), cosA = cosf(ay);
+            float dx = 0.0f, dz = 0.0f;
 
-            // Mouvement avant/arrière
-            if(keydown(KEY_8)) { cam.x -= sinA*MOVE_SPEED; cam.z += cosA*MOVE_SPEED; }
-            if(keydown(KEY_2)) { cam.x += sinA*MOVE_SPEED; cam.z -= cosA*MOVE_SPEED; }
+            // Forward/back
+            if(keydown(KEY_8)) { dx -= sinA*MOVE_SPEED; dz += cosA*MOVE_SPEED; }
+            if(keydown(KEY_2)) { dx += sinA*MOVE_SPEED; dz -= cosA*MOVE_SPEED; }
 
-            // Mouvement latéral (normalisé)
-            if(keydown(KEY_4)) { cam.x -= cosA*MOVE_SPEED; cam.z -= sinA*MOVE_SPEED; }
-            if(keydown(KEY_6)) { cam.x += cosA*MOVE_SPEED; cam.z += sinA*MOVE_SPEED; }
+            // Strafe left/right
+            if(keydown(KEY_4)) { dx -= cosA*MOVE_SPEED; dz -= sinA*MOVE_SPEED; }
+            if(keydown(KEY_6)) { dx += cosA*MOVE_SPEED; dz += sinA*MOVE_SPEED; }
 
-            // Collision avec les murs
-            check_collision_walls(&cam);
+            // Apply XZ movement with collisions against cubes and world
+            move_with_collisions(&cam, dx, dz);
 
-            // Saut (touche 7 ou 9)
+            // Jump
             if((keydown(KEY_7) || keydown(KEY_9)) && on_ground) {
                 velocity_y = -JUMP_FORCE;
                 on_ground = 0;
             }
 
-            // Gravité (s'applique toujours !)
+            // Gravity always
             velocity_y += GRAVITY;
             cam.y += velocity_y;
 
-            // Collision avec le sol
+            // Ground collision
             if(cam.y >= GROUND_Y) {
                 cam.y = GROUND_Y;
                 velocity_y = 0.0f;
@@ -172,18 +212,19 @@ int main(void) {
                 on_ground = 0;
             }
 
-            // Vol libre (touche 3 pour descendre)
+            // Free-fly down
             if(keydown(KEY_3)) {
                 cam.y += MOVE_SPEED;
                 velocity_y = 0.0f;
             }
 
-            // Collision avec le cube
-            check_collision_cube(&cam, ax, ay);
-
-            // Petite pause pour ne pas surcharger le CPU
+            // Small busy-wait to avoid maxing out CPU
             for(volatile int i=0; i<20000; i++);
         }
+
+        // Simple frame pacing to approximate TARGET_FPS
+        int frame_ms = 1000 / TARGET_FPS;
+        sleep_ms(frame_ms);
     }
 
     return 1;
