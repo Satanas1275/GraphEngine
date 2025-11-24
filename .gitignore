@@ -10,3 +10,6 @@ __pycache__/
 *.sublime-project
 *.sublime-workspace
 .vscode
+
+# Uncompiled distribution packages
+CasioGraph3DGameEngine.zip
