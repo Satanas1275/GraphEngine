@@ -1,4 +1,4 @@
-# CasioGraph-3D-game-engine
+# GraphEngine
 
 **CasioGraph-3D-game-engine** is my first 3D game engine designed for the **CASIO Graph 35+E II** calculator.  
 It aims to bring real-time 3D rendering, movement, and game logic to a device with extremely limited hardware — pushing the calculator to its limits.
