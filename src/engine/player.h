@@ -38,7 +38,6 @@ static inline Vec3 player_eye(const Player *p) {
 // ─── Update (appelé à chaque substep) ───────────────────────────────────────
 
 #define ROT_SPEED  0.01f
-#define MOVE_SPEED 0.08f
 
 static inline void player_update(Player *p) {
     // ── Rotation ──
